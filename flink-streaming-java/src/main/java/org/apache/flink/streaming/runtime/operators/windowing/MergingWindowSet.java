@@ -91,6 +91,8 @@ public class MergingWindowSet<W extends Window> {
 
         initialMapping = new HashMap<>();
         initialMapping.putAll(mapping);
+
+        System.out.println("window state size:" + initialMapping.size());
     }
 
     /**
@@ -154,6 +156,7 @@ public class MergingWindowSet<W extends Window> {
 
         List<W> windows = new ArrayList<>();
 
+        // TIMER take all the window keys to perform merge
         windows.addAll(this.mapping.keySet());
         windows.add(newWindow);
 

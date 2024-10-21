@@ -17,10 +17,36 @@
 
 package org.apache.flink.streaming.examples.wordcount;
 
+import java.io.BufferedReader;
+import java.io.FileReader;
+import org.apache.flink.streaming.api.functions.source.SourceFunction;
+import org.apache.flink.api.common.functions.ReduceFunction;
+import org.apache.flink.api.common.io.ratelimiting.FlinkConnectorRateLimiter;
+import org.apache.flink.api.common.io.ratelimiting.GuavaFlinkConnectorRateLimiter;
+import org.apache.flink.api.common.serialization.SimpleStringSchema;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.api.java.utils.ParameterTool;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.configuration.TaskManagerOptions;
+import org.apache.flink.core.fs.FileSystem;
+import org.apache.flink.streaming.api.TimeCharacteristic;
+import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.functions.AssignerWithPunctuatedWatermarks;
+import org.apache.flink.streaming.api.functions.timestamps.AscendingTimestampExtractor;
+import org.apache.flink.streaming.api.functions.windowing.PassThroughWindowFunction;
+import org.apache.flink.streaming.api.watermark.Watermark;
+import org.apache.flink.streaming.api.windowing.assigners.EventTimeSessionWindows;
+import org.apache.flink.streaming.api.windowing.assigners.TumblingEventTimeWindows;
+import org.apache.flink.streaming.api.windowing.time.Time;
+import org.apache.flink.util.OutputTag;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.api.common.functions.AggregateFunction;
 import org.apache.flink.api.common.functions.FlatMapFunction;
 import org.apache.flink.api.common.serialization.SimpleStringEncoder;
 import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.api.java.tuple.Tuple3;
 import org.apache.flink.configuration.MemorySize;
 import org.apache.flink.connector.file.sink.FileSink;
 import org.apache.flink.connector.file.src.FileSource;
@@ -28,6 +54,9 @@ import org.apache.flink.connector.file.src.reader.TextLineInputFormat;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.sink.filesystem.rollingpolicies.DefaultRollingPolicy;
+import org.apache.flink.streaming.api.functions.timestamps.BoundedOutOfOrdernessTimestampExtractor;
+import org.apache.flink.streaming.api.windowing.assigners.SlidingProcessingTimeWindows;
+import org.apache.flink.streaming.api.windowing.time.Time;
 import org.apache.flink.streaming.examples.wordcount.util.CLI;
 import org.apache.flink.streaming.examples.wordcount.util.WordCountData;
 import org.apache.flink.util.Collector;
@@ -70,19 +99,21 @@ public class WordCount {
     // *************************************************************************
 
     public static void main(String[] args) throws Exception {
+
         final CLI params = CLI.fromArgs(args);
 
         // Create the execution environment. This is the main entrypoint
         // to building a Flink application.
         final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
 
+        /*
+
         // Apache Flink’s unified approach to stream and batch processing means that a DataStream
         // application executed over bounded input will produce the same final results regardless
         // of the configured execution mode. It is important to note what final means here: a job
         // executing in STREAMING mode might produce incremental updates (think upserts in
-        // a database) while in BATCH mode, it would only produce one final result at the end. The
-        // final result will be the same if interpreted correctly, but getting there can be
-        // different.
+        // a database) while a BATCH job would only produce one final result at the end. The final
+        // result will be the same if interpreted correctly, but getting there can be different.
         //
         // The “classic” execution behavior of the DataStream API is called STREAMING execution
         // mode. Applications should use streaming execution for unbounded jobs that require
@@ -93,7 +124,7 @@ public class WordCount {
         // join/aggregation strategies can be used, in addition to a different shuffle
         // implementation that allows more efficient task scheduling and failure recovery behavior.
         //
-        // By setting the runtime mode to AUTOMATIC, Flink will choose BATCH if all sources
+        // By setting the runtime mode to AUTOMATIC, Flink will choose BATCH  if all sources
         // are bounded and otherwise STREAMING.
         env.setRuntimeMode(params.getExecutionMode());
 
@@ -118,17 +149,23 @@ public class WordCount {
             text = env.fromData(WordCountData.WORDS).name("in-memory-input");
         }
 
+        Duration windowSize = Duration.ofSeconds(10);
+        Duration slideSize = Duration.ofSeconds(5);
+
         DataStream<Tuple2<String, Integer>> counts =
                 // The text lines read from the source are split into words
                 // using a user-defined function. The tokenizer, implemented below,
-                // will output each word as a (2-tuple) containing (word, 1)
-                text.flatMap(new Tokenizer())
+                // will output each words as a (2-tuple) containing (word, 1)
+                text.flatMap(new WordCount.Tokenizer())
                         .name("tokenizer")
                         // keyBy groups tuples based on the "0" field, the word.
                         // Using a keyBy allows performing aggregations and other
                         // stateful transformations over data on a per-key basis.
                         // This is similar to a GROUP BY clause in a SQL query.
                         .keyBy(value -> value.f0)
+                        // create windows of windowSize records slided every slideSize records
+                        .window(SlidingProcessingTimeWindows.of(windowSize, slideSize))
+                        //.countWindow(10,5)
                         // For each key, we perform a simple sum of the "1" field, the count.
                         // If the input data stream is bounded, sum will output a final count for
                         // each word. If it is unbounded, it will continuously output updates
@@ -154,9 +191,55 @@ public class WordCount {
             counts.print().name("print-sink");
         }
 
+        */
+
+        System.out.println("ao ce siamo?");
+
+        DataStream<Tuple3<Long, String, Double>> inputStream = env
+                .readTextFile("/home/maurofama/flink-microbench/dataset/sample-200.csv")
+                .map(line -> {
+                    String[] fields = line.split(",");
+                    return new Tuple3<>(Long.parseLong(fields[0]), fields[1], Double.parseDouble(fields[2]));
+                });
+
+        // Define sliding window of 5 elements with a slide of 2 elements
+        DataStream<Tuple3<String, Double, Double>> slidingWindowStream = inputStream
+                .keyBy(1) // Key by the second field (key)
+                .window(SlidingProcessingTimeWindows.of(Time.seconds(5), Time.seconds(2)))
+                .aggregate(new AverageAggregate());
+
+        // Print the results
+        slidingWindowStream.print();
+
         // Apache Flink applications are composed lazily. Calling execute
         // submits the Job and begins processing.
         env.execute("WordCount");
+
+
+
+    }
+
+    public static class AverageAggregate implements AggregateFunction<Tuple3<Long, String, Double>, Tuple3<String, Double, Double>, Tuple3<String, Double, Double>> {
+
+        @Override
+        public Tuple3<String, Double, Double> createAccumulator() {
+            return new Tuple3<>("", 0.0, 0.0);
+        }
+
+        @Override
+        public Tuple3<String, Double, Double> add(Tuple3<Long, String, Double> value, Tuple3<String, Double, Double> accumulator) {
+            return new Tuple3<>(value.f1, accumulator.f1 + value.f2, accumulator.f2 + 1.0);
+        }
+
+        @Override
+        public Tuple3<String, Double, Double> getResult(Tuple3<String, Double, Double> accumulator) {
+            return new Tuple3<>(accumulator.f0, accumulator.f1 / accumulator.f2, accumulator.f1);
+        }
+
+        @Override
+        public Tuple3<String, Double, Double> merge(Tuple3<String, Double, Double> a, Tuple3<String, Double, Double> b) {
+            return new Tuple3<>(a.f0, a.f1 + b.f1, a.f2 + b.f2);
+        }
     }
 
     // *************************************************************************
@@ -178,7 +261,7 @@ public class WordCount {
 
             // emit the pairs
             for (String token : tokens) {
-                if (token.length() > 0) {
+                if (!token.isEmpty()) {
                     out.collect(new Tuple2<>(token, 1));
                 }
             }

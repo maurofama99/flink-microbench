@@ -52,6 +52,7 @@ import org.apache.flink.runtime.state.VoidNamespaceSerializer;
 import org.apache.flink.runtime.state.internal.InternalAppendingState;
 import org.apache.flink.runtime.state.internal.InternalListState;
 import org.apache.flink.runtime.state.internal.InternalMergingState;
+import org.apache.flink.streaming.api.functions.windowing.ProcessWindowFunction;
 import org.apache.flink.streaming.api.operators.AbstractUdfStreamOperator;
 import org.apache.flink.streaming.api.operators.ChainingStrategy;
 import org.apache.flink.streaming.api.operators.InternalTimer;
@@ -175,6 +176,12 @@ public class WindowOperator<K, IN, ACC, OUT, W extends Window>
 
     protected transient InternalTimerService<W> internalTimerService;
 
+    final OutputTag<String> latencyOutputTag = new OutputTag<String>("latency") {
+    };
+    protected StringBuilder measures;
+    private boolean first = true;
+
+
     /** Creates a new {@code WindowOperator} based on the given policies and user functions. */
     public WindowOperator(
             WindowAssigner<? super IN, W> windowAssigner,
@@ -276,16 +283,31 @@ public class WindowOperator<K, IN, ACC, OUT, W extends Window>
 
     @Override
     public void processElement(StreamRecord<IN> element) throws Exception {
+        measures = new StringBuilder();
+        if (first) measures.append("add,query,evict\n");
+        first = false;
+
+        long scope_start = System.nanoTime();
+        // TIMER scope start (sliding & session)
+
         final Collection<W> elementWindows =
                 windowAssigner.assignWindows(
                         element.getValue(), element.getTimestamp(), windowAssignerContext);
+
+        // TIMER scope end (sliding & session)
+        long scope = System.nanoTime() - scope_start;
 
         // if element is handled by none of assigned elementWindows
         boolean isSkippedElement = true;
 
         final K key = this.<K>getKeyedStateBackend().getCurrentKey();
 
+        long add_total = scope;
+        long evict_total = 0;
+        long content_total = 0;
+        long merge_total = 0;
         if (windowAssigner instanceof MergingWindowAssigner) {
+
             MergingWindowSet<W> mergingWindows = getMergingWindowSet();
 
             for (W window : elementWindows) {
@@ -293,6 +315,8 @@ public class WindowOperator<K, IN, ACC, OUT, W extends Window>
                 // adding the new window might result in a merge, in that case the actualWindow
                 // is the merged window and we work with that. If we don't merge then
                 // actualWindow == window
+                // TIMER merge start cont. (session)
+                long merge_start = System.nanoTime();
                 W actualWindow =
                         mergingWindows.addWindow(
                                 window,
@@ -349,6 +373,8 @@ public class WindowOperator<K, IN, ACC, OUT, W extends Window>
                                                 stateWindowResult, mergedStateWindows);
                                     }
                                 });
+                // TIMER merge end cont. (session)
+                merge_total = System.nanoTime() - merge_start;
 
                 // drop if the window is already late
                 if (isWindowLate(actualWindow)) {
@@ -363,8 +389,15 @@ public class WindowOperator<K, IN, ACC, OUT, W extends Window>
                             "Window " + window + " is not in in-flight window set.");
                 }
 
+                // TIMER add start (session)
+                long add_start = System.nanoTime();
+
                 windowState.setCurrentNamespace(stateWindow);
+
                 windowState.add(element.getValue());
+
+                // TIMER add end (session)
+                add_total += (System.nanoTime() - add_start);
 
                 triggerContext.key = key;
                 triggerContext.window = actualWindow;
@@ -372,7 +405,14 @@ public class WindowOperator<K, IN, ACC, OUT, W extends Window>
                 TriggerResult triggerResult = triggerContext.onElement(element);
 
                 if (triggerResult.isFire()) {
+                    // TIMER content start (session)
+                    long content_start = System.nanoTime();
+
                     ACC contents = windowState.get();
+
+                    // TIMER content end (session)
+                    content_total += (System.nanoTime() - content_start);
+
                     if (contents == null) {
                         continue;
                     }
@@ -387,7 +427,11 @@ public class WindowOperator<K, IN, ACC, OUT, W extends Window>
 
             // need to make sure to update the merging state in state
             mergingWindows.persist();
+
+            measures.append(add_total).append(",").append(content_total).append(",").append(evict_total).append(",").append(merge_total);
+
         } else {
+
             for (W window : elementWindows) {
 
                 // drop if the window is already late
@@ -396,8 +440,15 @@ public class WindowOperator<K, IN, ACC, OUT, W extends Window>
                 }
                 isSkippedElement = false;
 
+                long add_start = System.nanoTime();
+                // TIMER add start (sliding)
+
                 windowState.setCurrentNamespace(window);
+
                 windowState.add(element.getValue());
+
+                // TIMER add end  (sliding)
+                add_total += (System.nanoTime() - add_start);
 
                 triggerContext.key = key;
                 triggerContext.window = window;
@@ -405,11 +456,19 @@ public class WindowOperator<K, IN, ACC, OUT, W extends Window>
                 TriggerResult triggerResult = triggerContext.onElement(element);
 
                 if (triggerResult.isFire()) {
+
+                    // TIMER content start (sliding)
+                    long content_start = System.nanoTime();
+
                     ACC contents = windowState.get();
+
                     if (contents == null) {
                         continue;
                     }
-                    emitWindowContents(window, contents);
+                    emitWindowContents(window, contents); // aggregation computation
+
+                    // TIMER content end (sliding)
+                    content_total += (System.nanoTime() - content_start);
                 }
 
                 if (triggerResult.isPurge()) {
@@ -417,6 +476,8 @@ public class WindowOperator<K, IN, ACC, OUT, W extends Window>
                 }
                 registerCleanupTimer(window);
             }
+
+            measures.append(add_total).append(",").append(content_total).append(",").append(evict_total);
         }
 
         // side output input event if
@@ -431,16 +492,23 @@ public class WindowOperator<K, IN, ACC, OUT, W extends Window>
                 this.numLateRecordsDropped.inc();
             }
         }
+
+        this.output.collect(latencyOutputTag, new StreamRecord<>(measures.toString()));
     }
 
     @Override
     public void onEventTime(InternalTimer<K, W> timer) throws Exception {
+        measures = new StringBuilder();
+        long add_total = 0, content_start, content_total = 0, evict_total = 0;
+
         triggerContext.key = timer.getKey();
         triggerContext.window = timer.getNamespace();
 
         MergingWindowSet<W> mergingWindows;
 
         if (windowAssigner instanceof MergingWindowAssigner) {
+            // TIMER content start (session)
+            content_start = System.nanoTime();
             mergingWindows = getMergingWindowSet();
             W stateWindow = mergingWindows.getStateWindow(triggerContext.window);
             if (stateWindow == null) {
@@ -452,14 +520,23 @@ public class WindowOperator<K, IN, ACC, OUT, W extends Window>
                 windowState.setCurrentNamespace(stateWindow);
             }
         } else {
+            // TIMER content start (sliding)
+            content_start = System.nanoTime();
             windowState.setCurrentNamespace(triggerContext.window);
             mergingWindows = null;
         }
+        content_total += (System.nanoTime() - content_start);
 
         TriggerResult triggerResult = triggerContext.onEventTime(timer.getTimestamp());
 
         if (triggerResult.isFire()) {
+            content_start = System.nanoTime();
+
             ACC contents = windowState.get();
+
+            // TIMER content end (sliding & session)
+            content_total += (System.nanoTime() - content_start);
+
             if (contents != null) {
                 emitWindowContents(triggerContext.window, contents);
             }
@@ -469,15 +546,38 @@ public class WindowOperator<K, IN, ACC, OUT, W extends Window>
             windowState.clear();
         }
 
+        long evict_start = System.nanoTime();
+        // TIMER evict start (sliding & session)
         if (windowAssigner.isEventTime()
                 && isCleanupTime(triggerContext.window, timer.getTimestamp())) {
             clearAllState(triggerContext.window, windowState, mergingWindows);
         }
+        // TIMER evict end (sliding & session)
+        evict_total += (System.nanoTime() - evict_start);
 
         if (mergingWindows != null) {
             // need to make sure to update the merging state in state
             mergingWindows.persist();
         }
+
+        if (windowAssigner instanceof MergingWindowAssigner) {
+            measures
+                    .append(add_total)
+                    .append(",")
+                    .append(content_total)
+                    .append(",")
+                    .append(evict_total)
+                    .append(",0");
+        } else {
+            measures
+                    .append(add_total)
+                    .append(",")
+                    .append(content_total)
+                    .append(",")
+                    .append(evict_total);
+        }
+
+        this.output.collect(latencyOutputTag, new StreamRecord<>(measures.toString()));
     }
 
     @Override
@@ -661,7 +761,7 @@ public class WindowOperator<K, IN, ACC, OUT, W extends Window>
     /**
      * Base class for per-window {@link KeyedStateStore KeyedStateStores}. Used to allow per-window
      * state access for {@link
-     * org.apache.flink.streaming.api.functions.windowing.ProcessWindowFunction}.
+     * ProcessWindowFunction}.
      */
     public abstract class AbstractPerWindowStateStore extends DefaultKeyedStateStore {
 
@@ -728,7 +828,7 @@ public class WindowOperator<K, IN, ACC, OUT, W extends Window>
 
     /**
      * Regular per-window state store for use with {@link
-     * org.apache.flink.streaming.api.functions.windowing.ProcessWindowFunction}.
+     * ProcessWindowFunction}.
      */
     public class PerWindowStateStore extends AbstractPerWindowStateStore {
 

@@ -84,6 +84,7 @@ class HeapAggregatingState<K, N, IN, ACC, OUT> extends AbstractHeapMergingState<
 
     @Override
     public OUT get() {
+        // TIMER content internal
         ACC accumulator = getInternal();
         return accumulator != null
                 ? aggregateTransformation.aggFunction.getResult(accumulator)

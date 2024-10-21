@@ -211,6 +211,7 @@ public class TimeWindow extends Window {
         // sort the windows by the start time and then merge overlapping windows
 
         List<TimeWindow> sortedWindows = new ArrayList<>(windows);
+        // System.out.println("merging windows size: " + sortedWindows.size());
 
         Collections.sort(
                 sortedWindows,
